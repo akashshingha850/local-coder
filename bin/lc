@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# local-coder - run a private coding agent on your own GPUs, drive it from VSCode.
+set -uo pipefail
+
+LC_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV="$LC_ROOT/.venv"
+UNIT_DIR="$HOME/.config/systemd/user"
+GEN_DIR="$LC_ROOT/config/generated"
+
+# shellcheck source=/dev/null
+source "$LC_ROOT/config/local-coder.env"
+# shellcheck source=/dev/null
+source "$LC_ROOT/config/profiles.sh"
+
+C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[34m'; C_D=$'\033[2m'; C_0=$'\033[0m'
+ok(){   printf '%s  ok %s %s\n'   "$C_G" "$C_0" "$*"; }
+warn(){ printf '%s warn%s %s\n'   "$C_Y" "$C_0" "$*"; }
+err(){  printf '%s fail%s %s\n'   "$C_R" "$C_0" "$*"; }
+info(){ printf '%s      %s%s\n'   "$C_D" "$*" "$C_0"; }
+head1(){ printf '\n%s%s%s\n' "$C_B" "$*" "$C_0"; }
+
+SERVICES=(chat fim embed gateway)
+
+port_for() { case "$1" in
+  chat) echo "$LC_CHAT_PORT";; fim) echo "$LC_FIM_PORT";;
+  embed) echo "$LC_EMBED_PORT";; gateway) echo "$LC_GATEWAY_PORT";; esac; }
+
+# Which services does the active profile actually need?
+active_services() {
+  local out=(chat)
+  [ -n "${FIM_MODEL:-}" ]   && out+=(fim)
+  [ -n "${EMBED_MODEL:-}" ] && out+=(embed)
+  out+=(gateway)
+  printf '%s\n' "${out[@]}"
+}
+
+require_profile() {
+  load_profile "$LC_PROFILE" || exit 1
+  FIM_SERVED="${FIM_SERVED:-qwen2.5-coder-1.5b}"
+}
+
+# ─────────────────────────────────────────────────────────────── ensure key ──
+ensure_key() {
+  if [ "$LC_API_KEY" = "CHANGEME" ]; then
+    local k="sk-local-$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32)"
+    sed -i "s|^LC_API_KEY=.*|LC_API_KEY=\"$k\"|" "$LC_ROOT/config/local-coder.env"
+    LC_API_KEY="$k"
+    info "generated a new gateway API key (stored in config/local-coder.env)"
+  fi
+}
+
+# ──────────────────────────────────────────────────────────────── generate ──
+# Pick a tool-call parser the installed vLLM actually supports, so a version
+# bump that renames parsers degrades to a working default instead of crashing.
+resolve_parser() {
+  local want="$1" cache="$GEN_DIR/tool-parsers.txt"
+  mkdir -p "$GEN_DIR"
+  # `vllm serve --help=all` takes ~60s, so cache it against the vLLM version.
+  local ver; ver="$("$VENV/bin/vllm" --version 2>/dev/null | tail -1)"
+  if [ ! -s "$cache" ] || [ "$(head -1 "$cache")" != "$ver" ]; then
+    { echo "$ver"
+      "$VENV/bin/vllm" serve --help=all 2>/dev/null \
+        | grep -o -- '--tool-call-parser {[^}]*}' | tr ',{}' '\n\n\n' | sed '1d'
+    } > "$cache" 2>/dev/null
+  fi
+  if grep -qx -- "$want" "$cache" 2>/dev/null; then echo "$want"
+  elif grep -qx -- "hermes" "$cache" 2>/dev/null; then echo "hermes"
+  else echo "$want"; fi
+}
+
+gen_units() {
+  require_profile; ensure_key
+  mkdir -p "$UNIT_DIR" "$GEN_DIR" "$LC_ROOT/logs" "$LC_MODEL_DIR"
+  local parser; parser="$(resolve_parser "$CHAT_PARSER")"
+  [ "$parser" != "$CHAT_PARSER" ] && warn "vLLM has no '$CHAT_PARSER' parser; using '$parser'"
+
+  # systemd gives services a minimal PATH that excludes the venv. FlashInfer
+  # JIT-compiles kernels at startup and shells out to `ninja` and `nvcc`, so
+  # both the venv bin dir and the bundled CUDA toolchain must be on PATH.
+  local cuda_home="" nvcc_path
+  nvcc_path="$(find "$VENV/lib" -maxdepth 7 -type f -name nvcc 2>/dev/null | head -1)"
+  [ -n "$nvcc_path" ] && cuda_home="$(dirname "$(dirname "$nvcc_path")")"
+
+  local common_env=(
+    "Environment=HF_HOME=$LC_MODEL_DIR"
+    "Environment=HF_XET_HIGH_PERFORMANCE=1"
+    "Environment=VLLM_LOGGING_LEVEL=INFO"
+    "Environment=OMP_NUM_THREADS=1"
+    "Environment=PATH=$VENV/bin:${cuda_home:+$cuda_home/bin:}/usr/local/bin:/usr/bin:/bin"
+    # FlashInfer JIT-builds its sampler at startup, but the CUDA headers it
+    # ships disagree with the bundled CUDA 13 nvcc. vLLM's native sampler is
+    # equivalent here and needs no compiler, so startup stays hermetic.
+    "Environment=VLLM_USE_FLASHINFER_SAMPLER=0"
+  )
+  [ -n "$cuda_home" ] && common_env+=("Environment=CUDA_HOME=$cuda_home")
+
+  # Tensor parallelism needs NCCL, and NCCL's default peer-to-peer path hangs on
+  # this machine: AMD-Vi (IOMMU) is active with no passthrough, which blocks the
+  # GPU-to-GPU DMA that P2P depends on. The symptom is not an error - both worker
+  # processes spin at 100% CPU forever on the first all-reduce, and `lc up` times
+  # out with a log frozen just after "vLLM is using nccl".
+  #
+  # Note that `nvidia-smi topo -p2p r` reports OK regardless: it reports the
+  # capability, not whether DMA actually survives the IOMMU.
+  #
+  # Staging through host memory instead costs bandwidth but works. The better fix
+  # is `iommu=pt` on the kernel cmdline, which restores real P2P but needs a
+  # reboot; until then this keeps TP profiles functional.
+  #   Verify with: torchrun --nproc_per_node=2 <all-reduce test>
+  #
+  # NCCL_P2P_DISABLE alone is not enough: vLLM also has its own custom all-reduce
+  # that talks GPU-to-GPU over CUDA IPC, bypassing NCCL entirely, so it hangs on
+  # the same IOMMU wall a stage later - during warmup rather than init, with the
+  # engine logging "No available shared memory broadcast block found in 60
+  # seconds" on a loop while both workers spin at 100% CPU.
+  TP_FLAGS=""
+  if [ "${CHAT_TP:-1}" -gt 1 ]; then
+    common_env+=("Environment=NCCL_P2P_DISABLE=1")
+    TP_FLAGS="--disable-custom-all-reduce"
+  fi
+
+  _unit() { # name, description, cuda devices, exec line
+    local name="$1" desc="$2" gpus="$3" exec="$4"
+    { echo "[Unit]"
+      echo "Description=local-coder: $desc"
+      echo "After=network-online.target"
+      echo
+      echo "[Service]"
+      echo "Type=simple"
+      echo "WorkingDirectory=$LC_ROOT"
+      printf '%s\n' "${common_env[@]}"
+      [ -n "$gpus" ] && echo "Environment=CUDA_VISIBLE_DEVICES=$gpus"
+      echo "ExecStart=$exec"
+      echo "Restart=on-failure"
+      echo "RestartSec=10"
+      echo "TimeoutStartSec=${LC_STARTUP_TIMEOUT}"
+      echo "StandardOutput=append:$LC_ROOT/logs/$name.log"
+      echo "StandardError=append:$LC_ROOT/logs/$name.log"
+      echo "KillSignal=SIGINT"
+      echo
+      echo "[Install]"
+      echo "WantedBy=default.target"
+    } > "$UNIT_DIR/lc-$name.service"
+  }
+
+  _unit chat "$CHAT_DESC" "$CHAT_GPUS" \
+    "$VENV/bin/vllm serve $CHAT_MODEL --host $LC_BIND_HOST --port $LC_CHAT_PORT \
+--served-model-name local-chat --max-model-len $CHAT_LEN \
+--gpu-memory-utilization $CHAT_UTIL --tensor-parallel-size $CHAT_TP \
+--enable-auto-tool-choice --tool-call-parser $parser \
+--generation-config vllm $TP_FLAGS $CHAT_EXTRA"
+
+  if [ -n "$FIM_MODEL" ]; then
+    _unit fim "autocomplete $FIM_MODEL" "$FIM_GPUS" \
+      "$VENV/bin/vllm serve $FIM_MODEL --host $LC_BIND_HOST --port $LC_FIM_PORT \
+--served-model-name $FIM_SERVED --max-model-len $FIM_LEN \
+--gpu-memory-utilization $FIM_UTIL --max-num-seqs 8"
+  else rm -f "$UNIT_DIR/lc-fim.service"; fi
+
+  if [ -n "$EMBED_MODEL" ]; then
+    _unit embed "embeddings $EMBED_MODEL" "$EMBED_GPUS" \
+      "$VENV/bin/vllm serve $EMBED_MODEL --host $LC_BIND_HOST --port $LC_EMBED_PORT \
+--served-model-name local-embed --runner pooling --max-model-len $EMBED_LEN \
+--gpu-memory-utilization $EMBED_UTIL"
+  else rm -f "$UNIT_DIR/lc-embed.service"; fi
+
+  gen_litellm
+  _unit gateway "OpenAI-compatible gateway" "" \
+    "$VENV/bin/litellm --config $GEN_DIR/litellm.yaml --host $LC_BIND_HOST --port $LC_GATEWAY_PORT"
+
+  systemctl --user daemon-reload
+}
+
+gen_litellm() {
+  mkdir -p "$GEN_DIR"
+  { echo "# generated by 'lc up' - edit config/profiles.sh instead"
+    echo "model_list:"
+    echo "  - model_name: local-chat"
+    echo "    litellm_params:"
+    echo "      model: openai/local-chat"
+    echo "      api_base: http://127.0.0.1:$LC_CHAT_PORT/v1"
+    echo "      api_key: none"
+    if [ -n "$FIM_MODEL" ]; then
+    echo "  - model_name: $FIM_SERVED"
+    echo "    litellm_params:"
+    echo "      model: openai/$FIM_SERVED"
+    echo "      api_base: http://127.0.0.1:$LC_FIM_PORT/v1"
+    echo "      api_key: none"; fi
+    if [ -n "$EMBED_MODEL" ]; then
+    echo "  - model_name: local-embed"
+    echo "    litellm_params:"
+    echo "      model: openai/local-embed"
+    echo "      api_base: http://127.0.0.1:$LC_EMBED_PORT/v1"
+    echo "      api_key: none"; fi
+    echo
+    echo "general_settings:"
+    echo "  master_key: $LC_API_KEY"
+    echo
+    echo "litellm_settings:"
+    echo "  drop_params: true"
+    echo "  request_timeout: 1200"
+  } > "$GEN_DIR/litellm.yaml"
+}
+
+# ──────────────────────────────────────────────────────────────────── cmds ──
+cmd_doctor() {
+  require_profile
+  head1 "hardware"
+  if command -v nvidia-smi >/dev/null; then
+    nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv,noheader \
+      | while IFS= read -r l; do ok "GPU $l"; done
+  else err "nvidia-smi not found"; fi
+
+  head1 "toolchain"
+  [ -x "$VENV/bin/vllm" ] && ok "vLLM $("$VENV/bin/vllm" --version 2>/dev/null | head -1)" || err "vLLM missing - run scripts/install.sh"
+  [ -x "$VENV/bin/litellm" ] && ok "litellm gateway installed" || err "litellm missing - run scripts/install.sh"
+  [ -x "$VENV/bin/hf" ] && ok "huggingface cli installed" || warn "hf cli missing"
+  systemctl --user is-system-running >/dev/null 2>&1 && ok "systemd user manager running" || err "systemd --user unavailable"
+  if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = "yes" ]; then
+    ok "linger enabled - services survive logout"
+  else
+    warn "linger off - services stop when your last session ends. fix: lc enable-linger"
+  fi
+
+  head1 "profile: $LC_PROFILE"
+  info "chat   $CHAT_MODEL  (GPU $CHAT_GPUS, ctx $CHAT_LEN)"
+  [ -n "$FIM_MODEL" ]   && info "fim    $FIM_MODEL  (GPU $FIM_GPUS)"   || info "fim    disabled in this profile"
+  [ -n "$EMBED_MODEL" ] && info "embed  $EMBED_MODEL  (GPU $EMBED_GPUS)" || info "embed  disabled in this profile"
+
+  head1 "disk"
+  local avail; avail=$(df -BG --output=avail "$LC_MODEL_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
+  [ "${avail:-0}" -gt 80 ] && ok "${avail}G free at $LC_MODEL_DIR" || warn "only ${avail}G free at $LC_MODEL_DIR"
+
+  head1 "conflicts"
+  if systemctl is-active ollama >/dev/null 2>&1; then
+    local om; om=$(nvidia-smi --query-compute-apps=used_memory --format=csv,noheader 2>/dev/null | tr -dc '0-9\n' | paste -sd+ | bc 2>/dev/null)
+    warn "ollama is running - it holds VRAM when a model is loaded and will"
+    info "collide with vLLM. free it with:  ollama stop --all   (or systemctl stop ollama)"
+  else ok "no ollama competing for VRAM"; fi
+  echo
+}
+
+cmd_pull() {
+  require_profile
+  mkdir -p "$LC_MODEL_DIR"
+  export HF_HOME="$LC_MODEL_DIR" HF_XET_HIGH_PERFORMANCE=1
+  local models=("$CHAT_MODEL")
+  [ -n "$FIM_MODEL" ]   && models+=("$FIM_MODEL")
+  [ -n "$EMBED_MODEL" ] && models+=("$EMBED_MODEL")
+  for m in "${models[@]}"; do
+    head1 "downloading $m"
+    "$VENV/bin/hf" download "$m" || { err "download failed: $m"; return 1; }
+  done
+  ok "all weights for profile '$LC_PROFILE' are local"
+}
+
+wait_ready() { # port, label, timeout
+  local port="$1" label="$2" limit="${3:-$LC_STARTUP_TIMEOUT}" t=0
+  printf '  waiting for %s ' "$label"
+  while [ "$t" -lt "$limit" ]; do
+    if curl -fsS "http://127.0.0.1:$port/health" >/dev/null 2>&1 \
+    || curl -fsS "http://127.0.0.1:$port/v1/models" -H "Authorization: Bearer $LC_API_KEY" >/dev/null 2>&1; then
+      printf ' ready (%ss)\n' "$t"; return 0
+    fi
+    sleep 3; t=$((t+3)); printf '.'
+  done
+  printf ' TIMEOUT\n'; return 1
+}
+
+cmd_up() {
+  gen_units
+  local svcs; mapfile -t svcs < <(active_services)
+  head1 "starting profile '$LC_PROFILE'"
+  for s in "${svcs[@]}"; do
+    systemctl --user enable --now "lc-$s.service" >/dev/null 2>&1 \
+      || systemctl --user restart "lc-$s.service"
+  done
+  # Models load in parallel; gateway is instant but useless until vLLM answers.
+  local failed=0
+  for s in "${svcs[@]}"; do
+    wait_ready "$(port_for "$s")" "$s" || { failed=1; err "$s did not come up - lc logs $s"; }
+  done
+  echo
+  [ "$failed" = 0 ] && ok "local-coder is up. endpoint: http://127.0.0.1:$LC_GATEWAY_PORT/v1" \
+                    || err "some services failed"
+  info "next: lc test    then    lc vscode"
+  return "$failed"
+}
+
+cmd_down() {
+  for s in "${SERVICES[@]}"; do
+    systemctl --user disable --now "lc-$s.service" >/dev/null 2>&1
+  done
+  ok "all local-coder services stopped"
+}
+
+cmd_status() {
+  require_profile
+  head1 "services"
+  printf '  %-9s %-10s %-7s %s\n' SERVICE STATE PORT MODEL
+  for s in "${SERVICES[@]}"; do
+    [ -f "$UNIT_DIR/lc-$s.service" ] || continue
+    local st; st=$(systemctl --user is-active "lc-$s.service" 2>/dev/null)
+    local m=""; case "$s" in chat) m="$CHAT_MODEL";; fim) m="$FIM_MODEL";; embed) m="$EMBED_MODEL";; gateway) m="litellm";; esac
+    local col="$C_R"; [ "$st" = active ] && col="$C_G"
+    printf '  %-9s %s%-10s%s %-7s %s\n' "$s" "$col" "$st" "$C_0" "$(port_for "$s")" "$m"
+  done
+  head1 "gpu"
+  nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu,temperature.gpu \
+    --format=csv,noheader | while IFS= read -r l; do info "GPU $l"; done
+  echo
+}
+
+cmd_logs() {
+  local s="${1:-chat}"
+  tail -n "${2:-80}" -f "$LC_ROOT/logs/$s.log"
+}
+
+cmd_test() {
+  require_profile
+  local base="http://127.0.0.1:$LC_GATEWAY_PORT/v1" auth="Authorization: Bearer $LC_API_KEY"
+  head1 "1. model list"
+  curl -fsS "$base/models" -H "$auth" | python3 -c 'import json,sys
+for m in json.load(sys.stdin)["data"]: print("   -", m["id"])' || { err "gateway unreachable"; return 1; }
+
+  head1 "2. chat + code generation"
+  local t0 t1; t0=$(date +%s.%N)
+  local out; out=$(curl -fsS "$base/chat/completions" -H "$auth" -H 'Content-Type: application/json' -d '{
+    "model":"local-chat","max_tokens":120,"temperature":0,
+    "messages":[{"role":"user","content":"Write a Python function is_palindrome(s) that ignores case and non-alphanumerics. Code only."}]}')
+  t1=$(date +%s.%N)
+  if [ -n "$out" ]; then
+    python3 -c 'import json,sys
+d=json.loads(sys.argv[1]); c=d["choices"][0]["message"]["content"]
+print("\n".join("   "+l for l in c.strip().splitlines()[:12]))
+u=d.get("usage",{}); print("   [tokens:",u.get("completion_tokens"),"]")' "$out"
+    printf '   %.1fs wall\n' "$(echo "$t1-$t0" | bc)"
+    ok "chat works"
+  else err "chat failed"; fi
+
+  head1 "3. tool calling (the thing agents need)"
+  local tc; tc=$(curl -fsS "$base/chat/completions" -H "$auth" -H 'Content-Type: application/json' -d '{
+    "model":"local-chat","max_tokens":150,"temperature":0,
+    "messages":[{"role":"user","content":"Read the file src/main.py"}],
+    "tools":[{"type":"function","function":{"name":"read_file","description":"Read a file from disk",
+      "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]}')
+  python3 -c 'import json,sys
+try:
+  d=json.loads(sys.argv[1]); msg=d["choices"][0]["message"]
+  tcs=msg.get("tool_calls") or []
+  if tcs: print("   called:",tcs[0]["function"]["name"],tcs[0]["function"]["arguments"])
+  else: print("   no tool_calls returned; content:",(msg.get("content") or "")[:120])
+except Exception as e: print("   parse error",e)' "$tc"
+
+  if [ -n "$FIM_MODEL" ]; then
+    head1 "4. autocomplete (fill-in-middle)"
+    local fim; fim=$(curl -fsS "$base/completions" -H "$auth" -H 'Content-Type: application/json' -d "{
+      \"model\":\"$FIM_SERVED\",\"max_tokens\":40,\"temperature\":0,
+      \"prompt\":\"<|fim_prefix|>def quicksort(arr):\\n    if len(arr) <= 1:\\n        return arr\\n    pivot = <|fim_suffix|>\\n    return quicksort(left) + mid + quicksort(right)<|fim_middle|>\"}")
+    python3 -c 'import json,sys
+d=json.loads(sys.argv[1]); print("   completion:",repr(d["choices"][0]["text"][:160]))' "$fim" && ok "autocomplete works" || err "autocomplete failed"
+  fi
+
+  if [ -n "$EMBED_MODEL" ]; then
+    head1 "5. embeddings (codebase indexing)"
+    curl -fsS "$base/embeddings" -H "$auth" -H 'Content-Type: application/json' \
+      -d '{"model":"local-embed","input":["def foo(): pass"]}' \
+    | python3 -c 'import json,sys
+d=json.load(sys.stdin); print("   vector dim:",len(d["data"][0]["embedding"]))' && ok "embeddings work" || err "embeddings failed"
+  fi
+  echo
+}
+
+cmd_vscode() {
+  require_profile; ensure_key
+  bash "$LC_ROOT/scripts/write-vscode-config.sh"
+}
+
+cmd_profile() {
+  if [ -z "${1:-}" ]; then
+    require_profile
+    echo "active: $LC_PROFILE  ($CHAT_DESC)"
+    echo "available: $(list_profiles)"
+    return
+  fi
+  load_profile "$1" >/dev/null || exit 1
+  sed -i "s|^LC_PROFILE=.*|LC_PROFILE=\"\${LC_PROFILE:-$1}\"|" "$LC_ROOT/config/local-coder.env"
+  ok "profile set to '$1'"
+  info "apply it with:  lc pull && lc up"
+}
+
+cmd_enable_linger() {
+  sudo loginctl enable-linger "$USER" && ok "linger enabled - services now survive logout and start at boot"
+}
+
+usage() {
+cat <<USAGE
+local-coder - a private coding agent on your own GPUs
+
+  lc doctor          check GPUs, toolchain, disk, conflicts
+  lc pull            download the weights for the active profile
+  lc up              start everything (models stay resident)
+  lc down            stop everything and free VRAM
+  lc status          service + GPU state
+  lc test            end-to-end smoke test: chat, tools, autocomplete, embeddings
+  lc logs <svc> [n]  follow a log  (chat|fim|embed|gateway)
+  lc vscode          write the VSCode extension config
+  lc gen             regenerate systemd units + gateway config (no restart)
+  lc profile [name]  show or switch profile ($(list_profiles))
+  lc enable-linger   keep services running after you log out
+
+  endpoint  http://127.0.0.1:${LC_GATEWAY_PORT}/v1     (OpenAI-compatible)
+USAGE
+}
+
+case "${1:-help}" in
+  doctor) shift; cmd_doctor "$@";;
+  pull)   shift; cmd_pull "$@";;
+  gen)    shift; gen_units && ok "regenerated systemd units and gateway config";;
+  up)     shift; cmd_up "$@";;
+  down)   shift; cmd_down "$@";;
+  restart) shift; cmd_down; cmd_up "$@";;
+  status) shift; cmd_status "$@";;
+  logs)   shift; cmd_logs "$@";;
+  test)   shift; cmd_test "$@";;
+  vscode) shift; cmd_vscode "$@";;
+  profile) shift; cmd_profile "${1:-}";;
+  enable-linger) shift; cmd_enable_linger;;
+  help|-h|--help) usage;;
+  *) err "unknown command: $1"; echo; usage; exit 1;;
+esac

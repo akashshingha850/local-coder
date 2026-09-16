@@ -1,0 +1,24 @@
+{
+  "folders": [{ "path": ".." }],
+  "extensions": {
+    "recommendations": ["Continue.continue"]
+  },
+  "settings": {
+    "continue.telemetryEnabled": false,
+    "continue.enableTabAutocomplete": true,
+    "files.associations": { "*.env": "shellscript" },
+    "terminal.integrated.env.linux": {
+      "OPENAI_BASE_URL": "http://127.0.0.1:4000/v1"
+    }
+  },
+  "tasks": {
+    "version": "2.0.0",
+    "tasks": [
+      { "label": "local-coder: status", "type": "shell", "command": "./bin/lc status", "presentation": { "reveal": "always", "panel": "dedicated" }, "problemMatcher": [] },
+      { "label": "local-coder: up",     "type": "shell", "command": "./bin/lc up",     "presentation": { "reveal": "always", "panel": "dedicated" }, "problemMatcher": [] },
+      { "label": "local-coder: down",   "type": "shell", "command": "./bin/lc down",   "presentation": { "reveal": "always", "panel": "dedicated" }, "problemMatcher": [] },
+      { "label": "local-coder: test",   "type": "shell", "command": "./bin/lc test",   "presentation": { "reveal": "always", "panel": "dedicated" }, "problemMatcher": [] },
+      { "label": "local-coder: logs (chat)", "type": "shell", "command": "./bin/lc logs chat", "isBackground": true, "presentation": { "reveal": "always", "panel": "dedicated" }, "problemMatcher": [] }
+    ]
+  }
+}
